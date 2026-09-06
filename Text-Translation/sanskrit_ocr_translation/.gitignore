@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+.env
+*.pyc
+models/
+outputs/
+.ipynb_checkpoints/
+.pytest_cache/
+.streamlit/secrets.toml
+data/sanskrit_multidomain_dataset/
+data/processed/
+data/raw/
+
