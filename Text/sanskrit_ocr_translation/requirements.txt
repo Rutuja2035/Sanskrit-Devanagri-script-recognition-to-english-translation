@@ -1,0 +1,8 @@
+transformers
+sentencepiece
+torch
+indic-nlp-library
+sacrebleu
+pandas
+regex
+IndicTransToolkit
