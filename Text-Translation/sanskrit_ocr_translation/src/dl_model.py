@@ -101,3 +101,108 @@ def get_class_index_by_name(folder_name: str) -> Optional[int]:
         if info["name"] == folder_name:
             return idx
     return None
+
+
+# ---------------------------------------------------------------------------
+# Sanskrit Fine-Tuned Sequence Model (CRNN + BiGRU + CTC)
+# ---------------------------------------------------------------------------
+
+class SanskritLabelConverter:
+    """Encodes Devanagari text into token integer indices for CTC loss and decodes predictions."""
+
+    def __init__(self, dict_path: str) -> None:
+        self.char_to_id: Dict[str, int] = {}
+        self.id_to_char: Dict[int, str] = {}
+        self.blank_id = 0
+        self.id_to_char[0] = ""
+
+        current_id = 1
+        try:
+            with open(dict_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    ch = line.strip("\r\n")
+                    if ch and ch not in self.char_to_id:
+                        self.char_to_id[ch] = current_id
+                        self.id_to_char[current_id] = ch
+                        current_id += 1
+        except Exception:
+            pass
+
+        if " " not in self.char_to_id:
+            self.char_to_id[" "] = current_id
+            self.id_to_char[current_id] = " "
+            current_id += 1
+
+        self.num_classes = current_id
+
+    def encode(self, text: str) -> list[int]:
+        ids: list[int] = []
+        for ch in text:
+            if ch in self.char_to_id:
+                ids.append(self.char_to_id[ch])
+        return ids
+
+    def decode(self, ids: list[int]) -> str:
+        chars: list[str] = []
+        prev_id = -1
+        for idx in ids:
+            if idx != prev_id and idx != self.blank_id:
+                chars.append(self.id_to_char.get(idx, ""))
+            prev_id = idx
+        return "".join(chars)
+
+
+def get_sanskrit_crnn_model(num_classes: int):
+    """Factory creating the SanskritCRNN Layer."""
+    import paddle.nn as nn
+
+    class SanskritCRNN(nn.Layer):
+        def __init__(self, num_classes: int) -> None:
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2D(3, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2D(64),
+                nn.ReLU(),
+                nn.MaxPool2D(kernel_size=2, stride=2),
+
+                nn.Conv2D(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2D(128),
+                nn.ReLU(),
+                nn.MaxPool2D(kernel_size=2, stride=2),
+
+                nn.Conv2D(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2D(256),
+                nn.ReLU(),
+
+                nn.Conv2D(256, 256, kernel_size=(3, 1), padding=(1, 0)),
+                nn.BatchNorm2D(256),
+                nn.ReLU(),
+                nn.MaxPool2D(kernel_size=(2, 1), stride=(2, 1)),
+
+                nn.Conv2D(256, 512, kernel_size=3, padding=1),
+                nn.BatchNorm2D(512),
+                nn.ReLU(),
+                nn.MaxPool2D(kernel_size=(2, 1), stride=(2, 1)),
+
+                nn.Conv2D(512, 512, kernel_size=(3, 1), padding=0),
+                nn.BatchNorm2D(512),
+                nn.ReLU(),
+            )
+            self.rnn = nn.GRU(
+                input_size=512,
+                hidden_size=256,
+                num_layers=2,
+                direction="bidirectional",
+                time_major=False,
+            )
+            self.fc = nn.Linear(512, num_classes)
+
+        def forward(self, x):
+            feats = self.features(x)
+            feats = feats.squeeze(axis=2)
+            feats = feats.transpose(perm=[0, 2, 1])
+            rnn_out, _ = self.rnn(feats)
+            logits = self.fc(rnn_out)
+            return logits
+
+    return SanskritCRNN(num_classes)

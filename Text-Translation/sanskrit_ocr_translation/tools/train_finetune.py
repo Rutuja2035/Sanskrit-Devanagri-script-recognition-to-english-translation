@@ -89,7 +89,7 @@ class SanskritLabelConverter:
 # ---------------------------------------------------------------------------
 
 class SanskritLineDataset(Dataset):
-    """Paddle Dataset for loading and resizing Sanskrit line images."""
+    """Paddle Dataset for loading and resizing Sanskrit line images with in-memory caching."""
 
     def __init__(
         self,
@@ -98,7 +98,9 @@ class SanskritLineDataset(Dataset):
         converter: SanskritLabelConverter,
         target_h: int = 48,
         target_w: int = 320,
-        max_len: int = 60,
+        max_len: int = 64,
+        is_training: bool = False,
+        max_samples: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.data_dir = data_dir
@@ -106,6 +108,7 @@ class SanskritLineDataset(Dataset):
         self.target_h = target_h
         self.target_w = target_w
         self.max_len = max_len
+        self.is_training = is_training
         self.samples: List[Tuple[str, str]] = []
 
         if label_file.exists():
@@ -118,41 +121,62 @@ class SanskritLineDataset(Dataset):
                         if full_path.exists():
                             self.samples.append((str(full_path), text))
 
+        if max_samples is not None and len(self.samples) > max_samples:
+            import random
+            rng = random.Random(42)
+            rng.shuffle(self.samples)
+            self.samples = self.samples[:max_samples]
+
+        # Pre-process and cache all samples in memory for instantaneous epoch iterations
+        self.cached_chw: List[np.ndarray] = []
+        self.cached_padded_ids: List[np.ndarray] = []
+        self.cached_lengths: List[int] = []
+
+        for img_path, text in self.samples:
+            img = cv2.imread(img_path)
+            if img is None:
+                img = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
+
+            # Training data augmentation
+            if self.is_training:
+                # Slight random contrast / brightness
+                if np.random.rand() > 0.4:
+                    alpha = float(np.random.uniform(0.85, 1.15))
+                    beta = float(np.random.uniform(-10, 10))
+                    img = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+                # Slight blur
+                if np.random.rand() > 0.6:
+                    img = cv2.GaussianBlur(img, (3, 3), 0.5)
+
+            h, w = img.shape[:2]
+            ratio = float(self.target_h) / max(1, h)
+            new_w = min(self.target_w, max(1, int(w * ratio)))
+            resized = cv2.resize(img, (new_w, self.target_h))
+
+            canvas = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
+            canvas[:, :new_w] = resized
+
+            normalized = (canvas.astype(np.float32) / 127.5) - 1.0
+            chw = np.transpose(normalized, (2, 0, 1))
+
+            token_ids = self.converter.encode(text)[:self.max_len]
+            length = len(token_ids)
+            padded_ids = np.zeros((self.max_len,), dtype=np.int32)
+            if length > 0:
+                padded_ids[:length] = token_ids
+
+            self.cached_chw.append(chw)
+            self.cached_padded_ids.append(padded_ids)
+            self.cached_lengths.append(length)
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        img_path, text = self.samples[idx]
-        img = cv2.imread(img_path)
-        if img is None:
-            img = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
-
-        # Resize keeping aspect ratio, padding with 255
-        h, w = img.shape[:2]
-        ratio = float(self.target_h) / max(1, h)
-        new_w = min(self.target_w, max(1, int(w * ratio)))
-        resized = cv2.resize(img, (new_w, self.target_h))
-
-        canvas = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
-        canvas[:, :new_w] = resized
-
-        # Normalize to [-1.0, 1.0] and CHW format
-        normalized = (canvas.astype(np.float32) / 127.5) - 1.0
-        chw = np.transpose(normalized, (2, 0, 1))
-
-        # Encode text labels
-        token_ids = self.converter.encode(text)[:self.max_len]
-        length = len(token_ids)
-
-        # Pad tokens to max_len
-        padded_ids = np.zeros((self.max_len,), dtype=np.int32)
-        if length > 0:
-            padded_ids[:length] = token_ids
-
         return (
-            paddle.to_tensor(chw, dtype="float32"),
-            paddle.to_tensor(padded_ids, dtype="int32"),
-            paddle.to_tensor(length, dtype="int64"),
+            paddle.to_tensor(self.cached_chw[idx], dtype="float32"),
+            paddle.to_tensor(self.cached_padded_ids[idx], dtype="int32"),
+            paddle.to_tensor(self.cached_lengths[idx], dtype="int64"),
         )
 
 
@@ -227,49 +251,66 @@ def train_sanskrit_ocr(
     data_dir: Path,
     dict_path: Path,
     output_dir: Path,
-    epochs: int = 15,
+    epochs: int = 5,
     batch_size: int = 16,
     learning_rate: float = 0.0005,
+    max_train_samples: int = 350,
+    max_val_samples: int = 80,
     dry_run: bool = False,
 ) -> None:
     """Run fine-tuning training loop on Sanskrit multi-domain lines."""
     output_dir.mkdir(parents=True, exist_ok=True)
     converter = SanskritLabelConverter(dict_path)
-    print(f"[*] Loaded Sanskrit character dictionary: {converter.num_classes} classes (including blank)")
+    print(f"[*] Loaded Sanskrit character dictionary: {converter.num_classes} classes (including blank)", flush=True)
 
     train_label_file = data_dir / "train_labels.txt"
     val_label_file = data_dir / "val_labels.txt"
 
-    train_dataset = SanskritLineDataset(data_dir, train_label_file, converter)
-    val_dataset = SanskritLineDataset(data_dir, val_label_file, converter)
+    train_dataset = SanskritLineDataset(data_dir, train_label_file, converter, is_training=True, max_samples=max_train_samples)
+    val_dataset = SanskritLineDataset(data_dir, val_label_file, converter, is_training=False, max_samples=max_val_samples)
 
-    print(f"[*] Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    print(f"[*] Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}", flush=True)
     if len(train_dataset) == 0:
-        print("[!] No training samples found. Run generate_sanskrit_dataset.py first.")
+        print("[!] No training samples found. Run generate_sanskrit_dataset.py first.", flush=True)
         return
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     model = SanskritCRNN(num_classes=converter.num_classes)
+    weights_path = output_dir / "best_model.pdparams"
+    if weights_path.exists():
+        try:
+            state = paddle.load(str(weights_path))
+            if state.get("fc.weight") is not None and state["fc.weight"].shape == model.fc.weight.shape:
+                model.set_state_dict(state)
+                print(f"[+] Loaded pretrained weights from {weights_path} for warm-start", flush=True)
+            else:
+                filtered_state = {k: v for k, v in state.items() if not k.startswith("fc.")}
+                model.set_state_dict(filtered_state)
+                print(f"[+] Transferred {len(filtered_state)} feature extraction layers from previous checkpoint", flush=True)
+        except Exception as e:
+            print(f"[*] Starting fresh initialization: {e}", flush=True)
+
     ctc_loss = nn.CTCLoss(blank=0, reduction="mean")
-    optimizer = paddle.optimizer.Adam(learning_rate=learning_rate, parameters=model.parameters())
+    lr_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(learning_rate=learning_rate, T_max=epochs, eta_min=0.00005)
+    optimizer = paddle.optimizer.Adam(learning_rate=lr_scheduler, parameters=model.parameters())
 
     if dry_run:
-        print("[*] Dry run mode enabled: executing single batch check...")
+        print("[*] Dry run mode enabled: executing single batch check...", flush=True)
         for imgs, labels, lengths in train_loader:
             logits = model(imgs)
             log_probs = paddle.nn.functional.log_softmax(logits, axis=2)
             log_probs_tbc = paddle.transpose(log_probs, perm=[1, 0, 2])
             input_lengths = paddle.full([imgs.shape[0]], logits.shape[1], dtype="int64")
             loss = ctc_loss(log_probs_tbc, labels, input_lengths, lengths)
-            print(f"[+] Dry run pass successful! Computed CTC loss: {loss.item():.4f}")
+            print(f"[+] Dry run pass successful! Computed CTC loss: {loss.item():.4f}", flush=True)
             break
         return
 
-    print("=" * 65)
-    print(f"[*] STARTING SANSKRIT MULTI-DOMAIN FINE-TUNING ({epochs} Epochs)")
-    print("=" * 65)
+    print("=" * 65, flush=True)
+    print(f"[*] STARTING SANSKRIT MULTI-DOMAIN FINE-TUNING ({epochs} Epochs)", flush=True)
+    print("=" * 65, flush=True)
 
     best_val_loss = float("inf")
     start_time = time.time()
@@ -292,6 +333,8 @@ def train_sanskrit_ocr(
 
             total_loss += float(loss.item())
             batches += 1
+            if batches % 5 == 0 or batches == len(train_loader):
+                print(f"  [Epoch {epoch:02d}] Batch [{batches:02d}/{len(train_loader):02d}] CTC Loss: {loss.item():.4f}", flush=True)
 
         avg_train_loss = total_loss / max(1, batches)
 
@@ -312,10 +355,13 @@ def train_sanskrit_ocr(
         avg_val_loss = val_loss / max(1, val_batches) if val_batches > 0 else avg_train_loss
 
         print(
-            f"Epoch [{epoch:02d}/{epochs:02d}] "
+            f"--> Epoch [{epoch:02d}/{epochs:02d}] "
             f"| Train CTC Loss: {avg_train_loss:.4f} "
-            f"| Val Loss: {avg_val_loss:.4f}"
+            f"| Val Loss: {avg_val_loss:.4f} "
+            f"| LR: {lr_scheduler.get_lr():.6f}",
+            flush=True,
         )
+        lr_scheduler.step()
 
         # Save best model
         if avg_val_loss < best_val_loss:
@@ -350,9 +396,11 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default="data/sanskrit_multidomain_dataset")
     parser.add_argument("--dict_path", type=str, default="data/sanskrit_dict.txt")
     parser.add_argument("--output_dir", type=str, default="models/sanskrit_finetuned")
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--max_train_samples", type=int, default=350)
+    parser.add_argument("--max_val_samples", type=int, default=80)
     parser.add_argument("--dry_run", action="store_true")
 
     args = parser.parse_args()
@@ -363,5 +411,7 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
         dry_run=args.dry_run,
     )
