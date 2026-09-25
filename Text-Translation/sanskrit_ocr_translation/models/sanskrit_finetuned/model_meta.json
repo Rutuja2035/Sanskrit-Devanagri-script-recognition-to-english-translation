@@ -1,0 +1,12 @@
+{
+  "num_classes": 119,
+  "epochs": 5,
+  "best_val_loss": 0.3730343163013458,
+  "training_time_sec": 1285.94,
+  "domains": [
+    "digital",
+    "handwritten",
+    "manuscript"
+  ],
+  "dict_path": "data\\sanskrit_dict.txt"
+}

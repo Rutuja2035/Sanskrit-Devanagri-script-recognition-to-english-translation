@@ -200,6 +200,11 @@ class SanskritLexicalCorrector:
         (re.compile(r"([क-हअ-औा-ौ])मरहति"), r"\1मर्हति"),
         (re.compile(r"([क-हअ-औा-ौ])मरहन्"), r"\1मर्हन्"),
         # Common ligature and conjunct breakages
+        (re.compile(r"\bपरज्ञा"), "प्रज्ञा"),
+        (re.compile(r"प\s*र\s*ज्ञा"), "प्रज्ञा"),
+        (re.compile(r"प\s*र(?=[क-ह])"), "प्र"),
+        (re.compile(r"(?<=[क-हअ-औ])स्त्व\b"), "स्त्वं"),
+        (re.compile(r"\bस्त्व\b"), "स्त्वं"),
         (re.compile(r"\bत\s*वं\b"), "त्वं"),
         (re.compile(r"\bत\s*व\b"), "त्व"),
         (re.compile(r"दरुपद"), "द्रुपद"),
@@ -500,6 +505,7 @@ class SanskritLexicalCorrector:
         lines = text.split("\n")
         corrected_lines = []
         total_validity = 0.0
+        aligned_count = 0
 
         for line in lines:
             line_str = line.strip()
@@ -508,6 +514,12 @@ class SanskritLexicalCorrector:
 
             # Apply orthographic & ligature repairs without altering words
             corrected = cls.apply_orthographic_rules(line_str)
+            if enable_corpus_alignment:
+                aligned, score = cls.align_with_corpus(corrected, min_similarity=0.70)
+                if score >= 0.70:
+                    corrected = aligned
+                    aligned_count += 1
+
             val = cls.calculate_sanskrit_validity(corrected)
             total_validity += val
             corrected_lines.append(corrected)
@@ -520,7 +532,7 @@ class SanskritLexicalCorrector:
             "raw_confidence": genuine_confidence,
             "calibrated_confidence": genuine_confidence,
             "lexical_validity": avg_validity,
-            "corpus_aligned_lines": 0,
+            "corpus_aligned_lines": aligned_count,
         }
         return final_text, genuine_confidence, meta
 

@@ -2,8 +2,38 @@
 
 from __future__ import annotations
 
+import os
+import sys
+import importlib.util as _ilu
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# Windows PyTorch DLL compatibility hook
+if sys.platform == "win32":
+    _spec = _ilu.find_spec("torch")
+    if _spec and _spec.submodule_search_locations:
+        _lib = os.path.join(list(_spec.submodule_search_locations)[0], "lib")
+        if os.path.isdir(_lib):
+            os.environ["PATH"] = _lib + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(_lib)
+            except Exception:
+                pass
+
+# Disable MKLDNN default on CPU for PaddleX to prevent PIR attribute runtime crash in onednn_instruction.cc
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+try:
+    import paddlex.inference.models.runners.paddle_static.config.blocklists as _bl
+    for _m in (
+        "PP-OCRv5_mobile_det",
+        "devanagari_PP-OCRv5_mobile_rec",
+        "PP-OCRv4_mobile_det",
+        "devanagari_PP-OCRv4_mobile_rec",
+    ):
+        if _m not in _bl.MKLDNN_BLOCKLIST:
+            _bl.MKLDNN_BLOCKLIST.append(_m)
+except Exception:
+    pass
 
 import cv2
 import numpy as np
@@ -38,6 +68,16 @@ class PaddleSanskritOCR:
         char_dict_path: Optional[str | Path] = None,
         engine: Optional[Any] = None,
     ) -> None:
+        _project_root = Path(__file__).resolve().parent.parent
+        if rec_model_dir is None:
+            default_rec = _project_root / "models" / "sanskrit_finetuned"
+            if default_rec.exists() and ((default_rec / "best_model.pdparams").exists() or (default_rec / "final_model.pdparams").exists()):
+                rec_model_dir = default_rec
+        if char_dict_path is None:
+            default_dict = _project_root / "data" / "sanskrit_dict.txt"
+            if default_dict.exists():
+                char_dict_path = default_dict
+
         self.device = device
         self.detection_model = detection_model
         self.recognition_model = recognition_model
@@ -46,7 +86,7 @@ class PaddleSanskritOCR:
         self.engine: Optional[Any] = engine
         self.is_available = engine is not None
         self.initialization_error: Optional[str] = None
-        self.model_variant = "Fine-Tuned Multi-Domain Sanskrit" if self.rec_model_dir else "Official PP-OCRv5 Devanagari"
+        self.model_variant = "Fine-Tuned Multi-Domain SanskritCRNN + PP-OCRv5 Booster" if (self.rec_model_dir and (self.rec_model_dir / "best_model.pdparams").exists()) else "Official PP-OCRv5 Devanagari"
         self.custom_crnn = None
         self.converter = None
 
@@ -67,7 +107,17 @@ class PaddleSanskritOCR:
                 try:
                     import json
                     import paddle
-                    from src.dl_model import SanskritLabelConverter, get_sanskrit_crnn_model
+                    try:
+                        from src.dl_model import SanskritLabelConverter, get_sanskrit_crnn_model
+                    except ImportError:
+                        import importlib.util as _ilu
+                        _dl_path = Path(__file__).resolve().parent / "dl_model.py"
+                        _dl_spec = _ilu.spec_from_file_location("dl_model_mod", str(_dl_path))
+                        _dl_mod = _ilu.module_from_spec(_dl_spec)
+                        _dl_spec.loader.exec_module(_dl_mod)
+                        SanskritLabelConverter = _dl_mod.SanskritLabelConverter
+                        get_sanskrit_crnn_model = _dl_mod.get_sanskrit_crnn_model
+
                     self.converter = SanskritLabelConverter(str(self.char_dict_path))
                     state = paddle.load(str(weights_file))
                     if isinstance(state, dict) and "fc.weight" in state:
@@ -571,7 +621,7 @@ class PaddleSanskritOCR:
         suppress_borders: bool = False,
         multi_column: bool = False,
         high_accuracy_mode: bool = True,
-        enable_corpus_alignment: bool = False,
+        enable_corpus_alignment: bool = True,
     ) -> Dict[str, Any]:
         """
         Recognize Sanskrit Devanagari text from an image using robust Two-Pass OCR.
@@ -681,7 +731,7 @@ class PaddleSanskritOCR:
             calibrated_text, genuine_conf, lex_diag = SanskritLexicalCorrector.correct_text_and_calibrate_confidence(
                 raw_text,
                 raw_confidence,
-                enable_corpus_alignment=False
+                enable_corpus_alignment=enable_corpus_alignment
             )
 
             diag = {

@@ -1,8 +1,9 @@
 __pycache__/
 .venv/
 .env
-*.pyc
-models/
+models/*
+!models/sanskrit_finetuned/
+!models/sanskrit_finetuned/**
 outputs/
 .ipynb_checkpoints/
 .pytest_cache/

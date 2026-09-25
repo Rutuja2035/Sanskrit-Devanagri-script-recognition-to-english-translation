@@ -16,8 +16,8 @@ import numpy as np
 from src.ocr import PaddleSanskritOCR
 from src.preprocessing import preprocess_manuscript, preprocess_otsu, to_grayscale
 
-img_path = r"C:/Users/BHAVESH BARGAT/.gemini/antigravity/brain/e011acac-0dd8-4137-a88f-e61b9ee170ff/.user_uploaded/media_1788592856043.png"
-img = cv2.imread(img_path)
+img_path = Path(__file__).resolve().parent.parent / "data" / "test_evaluation" / "manuscript_1.jpg"
+img = cv2.imread(str(img_path))
 print("Image shape:", img.shape if img is not None else None)
 
 ocr = PaddleSanskritOCR(device="cpu")

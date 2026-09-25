@@ -10,6 +10,21 @@ if sys.platform == "win32":
                 os.add_dll_directory(_lib)
             except Exception:
                 pass
+
+# Disable MKLDNN default on CPU for PaddleX to prevent PIR attribute runtime crash in onednn_instruction.cc
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+try:
+    import paddlex.inference.models.runners.paddle_static.config.blocklists as _bl
+    for _m in (
+        "PP-OCRv5_mobile_det",
+        "devanagari_PP-OCRv5_mobile_rec",
+        "PP-OCRv4_mobile_det",
+        "devanagari_PP-OCRv4_mobile_rec",
+    ):
+        if _m not in _bl.MKLDNN_BLOCKLIST:
+            _bl.MKLDNN_BLOCKLIST.append(_m)
+except Exception:
+    pass
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -303,6 +318,9 @@ with tabs[1]:
 
                 st.markdown("---")
                 st.subheader("📝 Sanskrit Recognition Results")
+
+                if ocr_result.get("error"):
+                    st.error(f"⚠️ OCR Notice: {ocr_result['error']}")
 
                 # Prominent Top Metrics (Display Genuine Neural Model Confidence)
                 conf_val = ocr_result.get("confidence", 0.0)

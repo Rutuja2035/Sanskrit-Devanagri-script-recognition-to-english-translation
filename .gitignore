@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 venv/
 __pycache__/
 *.pyc
@@ -6,7 +6,9 @@ __pycache__/
 outputs/
 data/raw/
 data/processed/
-models/
+models/*
+!models/sanskrit_finetuned/
+!models/sanskrit_finetuned/**
 *.pt
 *.pth
 *.h5
