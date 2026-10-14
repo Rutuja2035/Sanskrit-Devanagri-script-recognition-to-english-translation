@@ -146,8 +146,8 @@ with st.sidebar:
     latency_mode = st.radio(
         "⚡ Latency / Inference Mode",
         ["Real-Time Fast (1.5s - 2.5s)", "Deep Precision Two-Pass (3s - 4.5s)"],
-        index=0,
-        help="Real-time mode uses single-pass inference to reduce latency while preserving high accuracy."
+        index=1,
+        help="Deep Precision mode activates multi-view Test-Time Augmentation (TTA) and Pass 2 adaptive illumination."
     )
     is_fast_mode = "Real-Time" in latency_mode
 
@@ -265,17 +265,30 @@ if uploaded_file is not None:
         st.markdown('<div class="section-header">🔍 Sanskrit Recognition Output</div>', unsafe_allow_html=True)
         ocr_start = time.time()
         with st.spinner("Recognizing Devanagari script via PP-OCRv5 + SanskritCRNN..."):
-            raw_text = perform_ocr(
+            # Multi-view evaluation: evaluate both native capture and enhanced preprocessed view
+            raw_text_orig = perform_ocr(
                 image,
                 high_accuracy_mode=(not is_fast_mode),
                 enable_corpus_alignment=enable_lexical_correction
             )
-            if not raw_text.strip() and processed_image is not None:
-                raw_text = perform_ocr(
+            raw_text_proc = ""
+            if processed_image is not None:
+                raw_text_proc = perform_ocr(
                     processed_image,
                     high_accuracy_mode=(not is_fast_mode),
                     enable_corpus_alignment=enable_lexical_correction
                 )
+            
+            # Select the more complete recognition candidate
+            orig_len = len(raw_text_orig.strip())
+            proc_len = len(raw_text_proc.strip())
+            if not orig_len and proc_len:
+                raw_text = raw_text_proc
+            elif proc_len >= orig_len and proc_len > 0:
+                raw_text = raw_text_proc
+            else:
+                raw_text = raw_text_orig if orig_len else raw_text_proc
+
             cleaned_text = clean_ocr_text(raw_text)
         ocr_duration = time.time() - ocr_start
 

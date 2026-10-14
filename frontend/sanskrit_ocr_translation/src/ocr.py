@@ -27,6 +27,12 @@ _OCR_INSTANCE = None
 def get_ocr_engine(device: str = "cpu") -> PaddleSanskritOCR:
     global _OCR_INSTANCE
     if _OCR_INSTANCE is None:
+        try:
+            import paddle
+            if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+                device = "gpu"
+        except Exception:
+            pass
         _OCR_INSTANCE = PaddleSanskritOCR(device=device)
     return _OCR_INSTANCE
 

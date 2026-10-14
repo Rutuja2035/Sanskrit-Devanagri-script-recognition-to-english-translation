@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any, Dict
 
 try:
@@ -135,6 +137,16 @@ class SanskritToEnglishTranslator:
             "न जायते म्रियते वा कदाचिन्नायं भूत्वा भविता वा न भूयः": "The soul never takes birth nor dies at any time; nor does it cease to be after having once existed.",
             "ज्ञानेन तु तदज्ञानं येषां नाशितमात्मनः": "When ignorance is destroyed by knowledge of the True Self, that knowledge illuminates the Supreme Reality."
         }
+
+        expanded_file = Path(__file__).resolve().parent.parent / "data" / "sanskrit_expanded_corpus.json"
+        if expanded_file.exists():
+            try:
+                with open(expanded_file, "r", encoding="utf-8") as f:
+                    ext_data = json.load(f)
+                    ext_data.update(self.corpus_dict)
+                    self.corpus_dict = ext_data
+            except Exception:
+                pass
 
     def _clean_text(self, text: str) -> str:
         """Cleans and normalizes the input text."""
@@ -315,3 +327,40 @@ class SanskritToEnglishTranslator:
         """
         result = self.translate_with_metadata(text)
         return result["english"]
+
+
+_TRANSLATOR_INSTANCE = None
+
+
+def get_translator() -> SanskritToEnglishTranslator:
+    global _TRANSLATOR_INSTANCE
+    if _TRANSLATOR_INSTANCE is None:
+        _TRANSLATOR_INSTANCE = SanskritToEnglishTranslator()
+    return _TRANSLATOR_INSTANCE
+
+
+def translate_sanskrit_to_english(text: str, hf_token: str = None) -> str:
+    """Translates Sanskrit Devanagari text to English via multi-tier fallback (Corpus -> Google -> MyMemory -> NLLB)."""
+    if not text or not text.strip():
+        return ""
+
+    if hf_token:
+        try:
+            import requests
+            api_url = "https://api-inference.huggingface.co/models/facebook/nllb-200-distilled-600M"
+            headers = {"Authorization": f"Bearer {hf_token}"}
+            payload = {
+                "inputs": text,
+                "parameters": {"src_lang": "san_Deva", "tgt_lang": "eng_Latn"}
+            }
+            resp = requests.post(api_url, headers=headers, json=payload, timeout=8)
+            if resp.status_code == 200:
+                res = resp.json()
+                if isinstance(res, list) and len(res) > 0 and "translation_text" in res[0]:
+                    return res[0]["translation_text"]
+        except Exception:
+            pass
+
+    translator = get_translator()
+    return translator.translate(text)
+

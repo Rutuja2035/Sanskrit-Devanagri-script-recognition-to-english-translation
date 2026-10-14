@@ -161,16 +161,18 @@ class SanskritLineDataset(Dataset):
 
             token_ids = self.converter.encode(text)[:self.max_len]
             length = len(token_ids)
+            if length == 0:
+                continue  # Avoid zero-length targets which cause NaN in CTC loss
+
             padded_ids = np.zeros((self.max_len,), dtype=np.int32)
-            if length > 0:
-                padded_ids[:length] = token_ids
+            padded_ids[:length] = token_ids
 
             self.cached_chw.append(chw)
             self.cached_padded_ids.append(padded_ids)
             self.cached_lengths.append(length)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.cached_lengths)
 
     def __getitem__(self, idx: int):
         return (
@@ -247,15 +249,52 @@ class SanskritCRNN(nn.Layer):
 # Training & Validation Runner
 # ---------------------------------------------------------------------------
 
+def safe_paddle_save(state_dict: dict, file_path: Path, max_retries: int = 5) -> None:
+    """Safely save PaddlePaddle state_dict avoiding Windows/OneDrive file lock conflicts."""
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = file_path.parent / f"tmp_{int(time.time() * 1000)}_{os.getpid()}_{file_path.name}"
+    
+    try:
+        paddle.save(state_dict, str(temp_path))
+    except Exception:
+        # Fallback to direct save
+        paddle.save(state_dict, str(file_path))
+        return
+
+    for attempt in range(max_retries):
+        try:
+            if file_path.exists():
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            os.replace(temp_path, file_path)
+            return
+        except Exception:
+            time.sleep(1.0)
+
+    try:
+        import shutil
+        shutil.copyfile(str(temp_path), str(file_path))
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[!] Warning: safe_paddle_save final fallback: {e}", flush=True)
+
 def train_sanskrit_ocr(
     data_dir: Path,
     dict_path: Path,
     output_dir: Path,
+    train_label: Optional[str | Path] = None,
+    val_label: Optional[str | Path] = None,
     epochs: int = 5,
     batch_size: int = 16,
     learning_rate: float = 0.0005,
-    max_train_samples: int = 350,
-    max_val_samples: int = 80,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
     dry_run: bool = False,
 ) -> None:
     """Run fine-tuning training loop on Sanskrit multi-domain lines."""
@@ -263,15 +302,20 @@ def train_sanskrit_ocr(
     converter = SanskritLabelConverter(dict_path)
     print(f"[*] Loaded Sanskrit character dictionary: {converter.num_classes} classes (including blank)", flush=True)
 
-    train_label_file = data_dir / "train_labels.txt"
-    val_label_file = data_dir / "val_labels.txt"
+    train_label_file = Path(train_label) if train_label else (data_dir / "train_labels.txt")
+    if not train_label_file.exists():
+        train_label_file = data_dir / "train.txt"
+
+    val_label_file = Path(val_label) if val_label else (data_dir / "val_labels.txt")
+    if not val_label_file.exists():
+        val_label_file = data_dir / "val.txt"
 
     train_dataset = SanskritLineDataset(data_dir, train_label_file, converter, is_training=True, max_samples=max_train_samples)
     val_dataset = SanskritLineDataset(data_dir, val_label_file, converter, is_training=False, max_samples=max_val_samples)
 
     print(f"[*] Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}", flush=True)
     if len(train_dataset) == 0:
-        print("[!] No training samples found. Run generate_sanskrit_dataset.py first.", flush=True)
+        print(f"[!] No training samples found in {train_label_file}.", flush=True)
         return
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
@@ -294,7 +338,18 @@ def train_sanskrit_ocr(
 
     ctc_loss = nn.CTCLoss(blank=0, reduction="mean")
     lr_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(learning_rate=learning_rate, T_max=epochs, eta_min=0.00005)
-    optimizer = paddle.optimizer.Adam(learning_rate=lr_scheduler, parameters=model.parameters())
+    
+    grad_clip = None
+    if hasattr(paddle.nn, "ClipGradByNorm"):
+        grad_clip = paddle.nn.ClipGradByNorm(clip_norm=5.0)
+    elif hasattr(paddle.optimizer, "ClipGradByNorm"):
+        grad_clip = paddle.optimizer.ClipGradByNorm(clip_norm=5.0)
+
+    optimizer = paddle.optimizer.Adam(
+        learning_rate=lr_scheduler,
+        parameters=model.parameters(),
+        grad_clip=grad_clip,
+    )
 
     if dry_run:
         print("[*] Dry run mode enabled: executing single batch check...", flush=True)
@@ -304,7 +359,11 @@ def train_sanskrit_ocr(
             log_probs_tbc = paddle.transpose(log_probs, perm=[1, 0, 2])
             input_lengths = paddle.full([imgs.shape[0]], logits.shape[1], dtype="int64")
             loss = ctc_loss(log_probs_tbc, labels, input_lengths, lengths)
-            print(f"[+] Dry run pass successful! Computed CTC loss: {loss.item():.4f}", flush=True)
+            loss_val = float(loss.item())
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                print(f"[!] Dry run encountered non-finite CTC loss: {loss_val}", flush=True)
+            else:
+                print(f"[+] Dry run pass successful! Computed CTC loss: {loss_val:.4f}", flush=True)
             break
         return
 
@@ -313,6 +372,7 @@ def train_sanskrit_ocr(
     print("=" * 65, flush=True)
 
     best_val_loss = float("inf")
+    best_state_dict = None
     start_time = time.time()
 
     for epoch in range(1, epochs + 1):
@@ -328,13 +388,20 @@ def train_sanskrit_ocr(
             input_lengths = paddle.full([imgs.shape[0]], logits.shape[1], dtype="int64")
 
             loss = ctc_loss(log_probs_tbc, labels, input_lengths, lengths)
+            loss_val = float(loss.item())
+
+            # Numerical stability: skip batch if CTC loss produces NaN or Inf
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                print(f"  [!] Warning: Non-finite loss ({loss_val}) at Epoch {epoch}. Skipping batch.", flush=True)
+                continue
+
             loss.backward()
             optimizer.step()
 
-            total_loss += float(loss.item())
+            total_loss += loss_val
             batches += 1
-            if batches % 5 == 0 or batches == len(train_loader):
-                print(f"  [Epoch {epoch:02d}] Batch [{batches:02d}/{len(train_loader):02d}] CTC Loss: {loss.item():.4f}", flush=True)
+            if batches % 10 == 0 or batches == len(train_loader):
+                print(f"  [Epoch {epoch:02d}] Batch [{batches:02d}/{len(train_loader):02d}] CTC Loss: {loss_val:.4f}", flush=True)
 
         avg_train_loss = total_loss / max(1, batches)
 
@@ -349,8 +416,10 @@ def train_sanskrit_ocr(
                 v_log_probs_tbc = paddle.transpose(v_log_probs, perm=[1, 0, 2])
                 v_in_lengths = paddle.full([v_imgs.shape[0]], v_logits.shape[1], dtype="int64")
                 v_loss = ctc_loss(v_log_probs_tbc, v_labels, v_in_lengths, v_lengths)
-                val_loss += float(v_loss.item())
-                val_batches += 1
+                v_loss_val = float(v_loss.item())
+                if not (np.isnan(v_loss_val) or np.isinf(v_loss_val)):
+                    val_loss += v_loss_val
+                    val_batches += 1
 
         avg_val_loss = val_loss / max(1, val_batches) if val_batches > 0 else avg_train_loss
 
@@ -363,15 +432,24 @@ def train_sanskrit_ocr(
         )
         lr_scheduler.step()
 
-        # Save best model
+        # Cache best model weights in memory and save checkpoint safely
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
             best_path = output_dir / "best_model.pdparams"
-            paddle.save(model.state_dict(), str(best_path))
+            try:
+                safe_paddle_save(best_state_dict, best_path)
+            except Exception as e:
+                print(f"  [!] Note: Intermediate checkpoint save deferred: {e}", flush=True)
 
-    # Save final model & metadata
+    # Save final best model & final model checkpoints
+    best_path = output_dir / "best_model.pdparams"
     final_path = output_dir / "final_model.pdparams"
-    paddle.save(model.state_dict(), str(final_path))
+    if best_state_dict is not None:
+        safe_paddle_save(best_state_dict, best_path)
+    else:
+        safe_paddle_save(model.state_dict(), best_path)
+    safe_paddle_save(model.state_dict(), final_path)
 
     meta = {
         "num_classes": converter.num_classes,
@@ -392,15 +470,25 @@ def train_sanskrit_ocr(
 
 
 if __name__ == "__main__":
+    _base_dir = Path(__file__).resolve().parent.parent
+    _cand_data = _base_dir / "data" / "sanskrit_real_ocr"
+    _default_data = str(_cand_data) if _cand_data.exists() else "data/sanskrit_real_ocr"
+    _cand_dict = _base_dir / "data" / "sanskrit_dict.txt"
+    _default_dict = str(_cand_dict) if _cand_dict.exists() else "data/sanskrit_dict.txt"
+    _cand_out = _base_dir / "models" / "sanskrit_finetuned"
+    _default_out = str(_cand_out) if _cand_out.parent.exists() else "models/sanskrit_finetuned"
+
     parser = argparse.ArgumentParser(description="Fine-tune Sanskrit OCR Model with CTC")
-    parser.add_argument("--data_dir", type=str, default="data/sanskrit_multidomain_dataset")
-    parser.add_argument("--dict_path", type=str, default="data/sanskrit_dict.txt")
-    parser.add_argument("--output_dir", type=str, default="models/sanskrit_finetuned")
+    parser.add_argument("--data_dir", type=str, default=_default_data)
+    parser.add_argument("--train_label", type=str, default=None)
+    parser.add_argument("--val_label", type=str, default=None)
+    parser.add_argument("--dict_path", type=str, default=_default_dict)
+    parser.add_argument("--output_dir", type=str, default=_default_out)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=0.0005)
-    parser.add_argument("--max_train_samples", type=int, default=350)
-    parser.add_argument("--max_val_samples", type=int, default=80)
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_val_samples", type=int, default=None)
     parser.add_argument("--dry_run", action="store_true")
 
     args = parser.parse_args()
@@ -408,6 +496,8 @@ if __name__ == "__main__":
         data_dir=Path(args.data_dir),
         dict_path=Path(args.dict_path),
         output_dir=Path(args.output_dir),
+        train_label=Path(args.train_label) if args.train_label else None,
+        val_label=Path(args.val_label) if args.val_label else None,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,

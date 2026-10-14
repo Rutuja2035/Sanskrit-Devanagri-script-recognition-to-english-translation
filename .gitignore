@@ -9,6 +9,10 @@ data/processed/
 models/*
 !models/sanskrit_finetuned/
 !models/sanskrit_finetuned/**
+!Text-Translation/sanskrit_ocr_translation/models/sanskrit_finetuned/**
+!Text-Translation/sanskrit_ocr_translation/data/test_evaluation/**
+!Text-Translation/sanskrit_ocr_translation/data/sanskrit_expanded_corpus.json
+!Text-Translation/sanskrit_ocr_translation/data/sanskrit_postcorrection_rules.json
 *.pt
 *.pth
 *.h5

@@ -77,7 +77,13 @@ st.set_page_config(
 
 @st.cache_resource
 def load_paddle_ocr_model(variant: str = "Fine-Tuned Multi-Domain Sanskrit"):
-    device = os.getenv("PADDLE_DEVICE", "cpu")
+    device = os.getenv("PADDLE_DEVICE")
+    if not device:
+        try:
+            import paddle
+            device = "gpu" if (paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0) else "cpu"
+        except Exception:
+            device = "cpu"
     if variant == "Fine-Tuned Multi-Domain Sanskrit":
         finetuned_dir = APP_DIR / "models" / "sanskrit_finetuned"
         dict_path = APP_DIR / "data" / "sanskrit_dict.txt"
@@ -278,7 +284,7 @@ with tabs[1]:
         suppress_borders = False
         multi_column_mode = False
         high_acc_mode = True
-        corpus_align = False
+        corpus_align = True
         auto_deskew = True
 
         if st.button("🚀 Run OCR Recognition", type="primary", use_container_width=True):

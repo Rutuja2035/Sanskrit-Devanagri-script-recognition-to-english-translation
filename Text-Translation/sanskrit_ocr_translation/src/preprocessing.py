@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from typing import Optional, Tuple
 
 def to_grayscale(image: np.ndarray) -> np.ndarray:
     """
@@ -70,7 +71,7 @@ def preprocess_basic(image: np.ndarray) -> np.ndarray:
     gray = to_grayscale(image)
     return denoise(gray)
 
-def preprocess_adaptive(image: np.ndarray) -> np.ndarray:
+def preprocess_adaptive_threshold(image: np.ndarray) -> np.ndarray:
     """
     Preprocessing pipeline: Grayscale -> Denoise -> Adaptive Gaussian Thresholding.
     
@@ -177,6 +178,125 @@ def preprocess_sauvola(
         binary = despeckle_image(binary)
 
     return binary
+ 
+ 
+def flat_field_correction(image: np.ndarray, kernel_size: int = 51) -> np.ndarray:
+    """
+    Flatten uneven background illumination, paper texture, and scanner shadows
+    to elevate faint ink strokes uniformly across the page.
+    
+    Args:
+        image (np.ndarray): Input image (grayscale or color).
+        kernel_size (int): Size of morphological structuring element (must be odd).
+        
+    Returns:
+        np.ndarray: Illumination-flattened grayscale image normalized to uint8 [0, 255].
+    """
+    if not isinstance(image, np.ndarray) or image.size == 0:
+        return image
+    gray = to_grayscale(image)
+    h, w = gray.shape[:2]
+    min_dim = min(h, w)
+    if min_dim < 3:
+        return gray
+
+    k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+    max_k = min_dim if min_dim % 2 == 1 else min_dim - 1
+    k = max(3, min(k, max_k))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    normalized = cv2.divide(gray, np.maximum(background, 1), scale=255.0)
+    return np.clip(normalized, 0, 255).astype(np.uint8)
+
+
+def enhance_faint_strokes(
+    image: np.ndarray,
+    clip_limit: float = 3.0,
+    tile_grid_size: Tuple[int, int] = (8, 8),
+    boost_factor: float = 1.8,
+) -> np.ndarray:
+    """
+    Boost faint, low-contrast ink strokes using localized background subtraction
+    and adaptive contrast stretching to elevate faint gray strokes into crisp dark lines.
+    
+    Args:
+        image (np.ndarray): Input image (grayscale or color).
+        clip_limit (float): CLAHE contrast limit.
+        tile_grid_size (Tuple[int, int]): Size of grid for histogram equalization.
+        boost_factor (float): Multiplier for faint stroke gradient amplification.
+        
+    Returns:
+        np.ndarray: High-contrast image with amplified faint strokes.
+    """
+    if not isinstance(image, np.ndarray) or image.size == 0:
+        return image
+    gray = to_grayscale(image)
+    h, w = gray.shape[:2]
+    min_dim = min(h, w)
+    if min_dim < 3:
+        return gray
+
+    # 1. Estimate local illumination background safely
+    blur_k = min_dim // 4
+    if blur_k % 2 == 0:
+        blur_k += 1
+    blur_k = max(3, min(blur_k, min_dim if min_dim % 2 == 1 else min_dim - 1))
+    bg = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+
+    # 2. Extract dark stroke gradient and amplify faint ink
+    stroke_diff = cv2.subtract(bg, gray)
+    amplified_stroke = np.clip(
+        cv2.multiply(stroke_diff.astype(np.float32), float(boost_factor)),
+        0,
+        255
+    ).astype(np.uint8)
+    elevated = cv2.subtract(bg, amplified_stroke)
+
+    # 3. Apply CLAHE with bounded grid size
+    grid_w = max(1, min(tile_grid_size[0], w // 2))
+    grid_h = max(1, min(tile_grid_size[1], h // 2))
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(grid_w, grid_h))
+    enhanced = clahe.apply(elevated)
+
+    return enhanced
+
+
+def heal_shirorekha_and_ligatures(
+    image: np.ndarray,
+    kernel_size: Tuple[int, int] = (3, 1),
+) -> np.ndarray:
+    """
+    Bridge hairline gaps in broken Devanagari top bars (Shirorekha) and connect
+    detached vowel signs using directional horizontal morphological closing.
+    Handles both dark-on-light and light-on-dark text polarities, preserving color channels.
+    
+    Args:
+        image (np.ndarray): Input grayscale or color image.
+        kernel_size (Tuple[int, int]): Morphological kernel dimensions (width, height).
+        
+    Returns:
+        np.ndarray: Stroke-healed image with connected ligatures.
+    """
+    if not isinstance(image, np.ndarray) or image.size == 0:
+        return image
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return image
+
+    gray = to_grayscale(image)
+    kw = max(1, min(kernel_size[0], w))
+    kh = max(1, min(kernel_size[1], h))
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+    is_light_bg = np.mean(gray) > 127
+    if is_light_bg:
+        # For dark strokes on light background, close hairline breaks in dark ink
+        healed = 255 - cv2.morphologyEx(255 - gray, cv2.MORPH_CLOSE, h_kernel)
+    else:
+        healed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, h_kernel)
+
+    if image.ndim == 3 and image.shape[2] in (3, 4):
+        return cv2.cvtColor(healed, cv2.COLOR_GRAY2BGR)
+    return healed
 
 
 
@@ -480,6 +600,7 @@ def preprocess_adaptive(
     image: np.ndarray,
     deskew: bool = True,
     suppress_ruled_lines: bool = True,
+    heal_strokes: bool = True,
 ) -> np.ndarray:
     """
     Non-destructive adaptive preprocessing strategy for Sanskrit OCR.
@@ -490,12 +611,14 @@ def preprocess_adaptive(
     3. Uses large-scale Gaussian background estimation to normalize illumination variations.
     4. Applies gentle CLAHE (clipLimit=1.6) to enhance faint ink without stroke bloat.
     5. Safely neutralizes horizontal notebook ruled lines while protecting vertical stems and shirorekha.
-    6. Corrects minor rotational skew only if detected angle is noticeable (> 0.5 degrees).
+    6. Directionally heals hairline Shirorekha gaps and broken ligatures.
+    7. Corrects minor rotational skew only if detected angle is noticeable (> 0.5 degrees).
     
     Args:
         image: Input document or line image (BGR, RGB, or Grayscale).
         deskew: Whether to check and correct rotational skew.
         suppress_ruled_lines: Whether to neutralize notebook ruled lines.
+        heal_strokes: Whether to apply subtle horizontal ligature healing.
         
     Returns:
         np.ndarray: Enhanced high-fidelity BGR image optimized for PaddleOCR.
@@ -533,5 +656,91 @@ def preprocess_adaptive(
     clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
     enhanced = clahe.apply(normalized)
 
-    # 5. Return as BGR for PaddleOCR input pipeline
+    # 5. Directional Shirorekha & ligature healing
+    if heal_strokes:
+        enhanced = heal_shirorekha_and_ligatures(enhanced, kernel_size=(3, 1))
+
+    # 6. Return as BGR for PaddleOCR input pipeline
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
+def normalize_line_crop(crop: np.ndarray, target_h: int = 48) -> np.ndarray:
+    """
+    Dynamically rescale text line crops to the optimal receptive field height (e.g. 48px)
+    while strictly preserving horizontal aspect ratio, preventing delicate Devanagari
+    matras (ikara, anusvara, visarga, halant) from vanishing in low-resolution scans.
+    
+    Args:
+        crop: Input text line crop (BGR, RGB, or Grayscale).
+        target_h: Target line height in pixels (default: 48).
+        
+    Returns:
+        np.ndarray: Rescaled crop preserving aspect ratio.
+    """
+    if not isinstance(crop, np.ndarray) or crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    if h == 0 or w == 0 or h == target_h:
+        return crop
+
+    scale = float(target_h) / float(h)
+    target_w = max(16, int(round(w * scale)))
+    interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(crop, (target_w, target_h), interpolation=interp)
+    return resized
+
+
+def auto_deskew_image(image: np.ndarray, max_angle: float = 15.0) -> np.ndarray:
+    """
+    Detect and correct document tilt angle using robust Hough transform and contour moments.
+    
+    Args:
+        image: Input document image.
+        max_angle: Maximum allowable angle to correct (default +-15 degrees).
+        
+    Returns:
+        np.ndarray: Leveled upright image.
+    """
+    return deskew_text_lines(image, max_angle=max_angle)
+
+
+def clean_image(image, is_manuscript: bool = True):
+    """Clean and enhance Sanskrit image with Sauvola binarization, deskewing, and contrast curves."""
+    if image is None:
+        return image
+    from PIL import Image
+    was_pil = isinstance(image, Image.Image)
+    img_np = np.array(image) if was_pil else image
+
+    if is_manuscript:
+        cleaned_np = preprocess_manuscript(img_np, auto_scale=True, deskew=True)
+    else:
+        cleaned_np = preprocess_adaptive(img_np)
+
+    return Image.fromarray(cleaned_np) if was_pil else cleaned_np
+
+
+__all__ = [
+    "to_grayscale",
+    "denoise",
+    "enhance_contrast",
+    "preprocess_basic",
+    "preprocess_otsu",
+    "despeckle_image",
+    "preprocess_sauvola",
+    "suppress_document_borders",
+    "deskew_text_lines",
+    "auto_deskew_image",
+    "normalize_line_crop",
+    "suppress_notebook_ruled_lines",
+    "preprocess_handwritten",
+    "preprocess_manuscript",
+    "preprocess_adaptive",
+    "preprocess_adaptive_threshold",
+    "flat_field_correction",
+    "enhance_faint_strokes",
+    "heal_shirorekha_and_ligatures",
+    "clean_image",
+]
+
+

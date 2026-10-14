@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # Pre-compiled regular expressions for performance and readability
@@ -249,12 +250,17 @@ class SanskritLexicalCorrector:
         (re.compile(r"नाशतिमात्मन"), "नाशितमात्मन"),
         (re.compile(r"भवता\s+वा\s+न\s+भूयः"), "भविता वा न भूयः"),
         (re.compile(r"हन्यमाने\s+श्रीरे"), "हन्यमाने शरीरे"),
+        # Notebook line margin loss and verse boundary restoration
+        (re.compile(r"परावर\s*[।|]"), "परावरे ॥"),
+        (re.compile(r"परावर\s*$", re.MULTILINE), "परावरे ॥"),
+        (re.compile(r"परावरे\s*[।|]$", re.MULTILINE), "परावरे ॥"),
+        (re.compile(r"दृष्टे\s+परावर(?:\s*[।|॥]|\s*$)", re.MULTILINE), "दृष्टे परावरे ॥"),
         # Avagraha confusion with vowel 'उ' in cursive writing (शाश्वतोउयं -> शाश्वतोऽयं)
         (re.compile(r"([ेोौ])उ([क-हअ-औ])"), r"\1ऽ\2"),
         # Manuscript verse ending punctuation normalization
         (re.compile(r"([क-हअ-औा-ौःँ])\s*[=\-_]+\s*"), r"\1 ॥ "),
-        (re.compile(r"([क-हअ-औा-ौःँ])\s*[\(\[]\s*$"), r"\1 ।"),
-        (re.compile(r"^\s*[\)\]=]\s*([क-हअ-औ])"), r"\1"),
+        (re.compile(r"([क-हअ-औा-ौःँ])\s*[\(\[]\s*$", re.MULTILINE), r"\1 ।"),
+        (re.compile(r"^\s*[\)\]=]\s*([क-हअ-औ])", re.MULTILINE), r"\1"),
         # Danda punctuation cleanup (closing parenthesis misread as danda or visa versa)
         (re.compile(r"\(\s*([।॥])"), r"\1"),
         (re.compile(r"([।॥])\s*\)"), r"\1"),
@@ -264,6 +270,7 @@ class SanskritLexicalCorrector:
         (re.compile(r"ू{2,}"), "ू"),
         (re.compile(r"े{2,}"), "ै"),
     ]
+
 
     # Classical Sanskrit reference lines for corpus-guided fuzzy alignment
     REFERENCE_CORPUS = [
@@ -381,6 +388,8 @@ class SanskritLexicalCorrector:
         "सङ्कल्पप्रभवान् कामान् त्यक्त्वा सर्वानशेषतः ।",
         "ज्ञानेन तु तदज्ञानं येषां नाशितमात्मनः ।",
         "तेषामादित्यवज्ज्ञानं प्रकाशयति तत्परम् ॥",
+        "भिद्यते हृदयग्रन्थिश्छिद्यन्ते सर्वसंशयाः ।",
+        "क्षीयन्ते चास्य कर्माणि तस्मिन्दृष्टे परावरे ॥",
         "अष्टाध्यायी १.१.१ वृद्धिरादैच् ॥",
         "अष्टाध्यायी १.१.२ अदेङ्गुणः ॥",
         "अष्टाध्यायी ६.१.७७ इको यणचि ॥",
@@ -420,23 +429,35 @@ class SanskritLexicalCorrector:
         best_match = line
         best_score = 0.0
 
-        # Build candidate pool: full lines and constituent padas
-        candidates = []
-        for ref in cls.REFERENCE_CORPUS:
-            candidates.append(ref)
-            # Split into individual padas / half-lines
-            padas = [p.strip() for p in re.split(r"[।॥]+", ref) if len(p.strip()) >= 4]
-            candidates.extend(padas)
+        # Fast path 1: Check primary REFERENCE_CORPUS first (sub-millisecond O(K))
+        if getattr(cls, "_CORE_CANDIDATES", None) is None:
+            cands = []
+            for ref in cls.REFERENCE_CORPUS:
+                cands.append(ref)
+                padas = [p.strip() for p in re.split(r"[।॥]+", ref) if len(p.strip()) >= 4]
+                cands.extend(padas)
+            cls._CORE_CANDIDATES = cands
+
+        candidates = cls._CORE_CANDIDATES
 
         for cand in candidates:
             clean_cand = re.sub(r"[\s|।॥]+", "", cand)
             if not clean_cand:
                 continue
 
+            len_target = len(clean_target)
+            len_cand = len(clean_cand)
+            min_l, max_l = min(len_target, len_cand), max(len_target, len_cand)
+            # Fast filter: skip candidate if maximum possible similarity is below min_similarity
+            if max_l > 0 and (2.0 * min_l / (len_target + len_cand)) < min_similarity:
+                continue
+
             ratio = difflib.SequenceMatcher(None, clean_target, clean_cand).ratio()
 
-            # High confidence if target is an exact or near-exact substring
-            if len(clean_target) >= 8 and (clean_target in clean_cand or clean_cand in clean_target):
+            # Substring match requires length ratio >= 0.75 to prevent short fragments/words
+            # from hijacking full lines (or vice-versa)
+            len_ratio = min_l / float(max_l)
+            if len_target >= 8 and len_ratio >= 0.75 and (clean_target in clean_cand or clean_cand in clean_target):
                 ratio = max(ratio, 0.94)
 
             if ratio > best_score:
@@ -445,6 +466,26 @@ class SanskritLexicalCorrector:
 
         if best_score >= min_similarity:
             return best_match, best_score
+
+        # Fast path 2: O(1) exact match lookup against expanded corpus
+        if getattr(cls, "_EXACT_CORPUS_MAP", None) is None:
+            exact_map = {}
+            exp_file = Path(__file__).resolve().parent.parent / "data" / "sanskrit_expanded_corpus.json"
+            if exp_file.exists():
+                try:
+                    import json
+                    with open(exp_file, "r", encoding="utf-8") as f:
+                        ext_dict = json.load(f)
+                    for k in ext_dict.keys():
+                        c_k = re.sub(r"[\s|।॥]+", "", k)
+                        if c_k and c_k not in exact_map:
+                            exact_map[c_k] = k
+                except Exception:
+                    pass
+            cls._EXACT_CORPUS_MAP = exact_map
+
+        if clean_target in cls._EXACT_CORPUS_MAP:
+            return cls._EXACT_CORPUS_MAP[clean_target], 1.0
         return line, best_score
 
     @classmethod
@@ -456,23 +497,65 @@ class SanskritLexicalCorrector:
         Returns:
             float: Validity ratio between 0.0 and 1.0.
         """
-        if not text.strip():
+        if not text or not isinstance(text, str):
             return 0.0
 
-        # Sanskrit characters (vowels, consonants, matras, dandas, accents)
+        clean = text.strip()
+        if not clean:
+            return 0.0
+
+        # Sanskrit characters (vowels, consonants, matras, dandas, accents, OM, avagraha, digits, standard punctuation)
         sanskrit_chars = set(
             "अआइईउऊऋॠऌॡएऐओऔकखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह"
-            "ािीुूृॄॢॣेैोौ्ंःँ॒॑०१२३४५६७८९।॥•· "
+            "ािीुूृॄॢॣेैोौ्ंःँ॒॑॓॔०१२३४५६७८९।॥•· ॐऽ़"
+            "0123456789-–—,.:;!?\"'“”‘’()[]{}/*\\#"
         )
-        total_chars = len(text)
-        valid_count = sum(1 for c in text if c in sanskrit_chars)
+        total_chars = len(clean)
+        valid_count = sum(1 for c in clean if c in sanskrit_chars)
         char_ratio = valid_count / max(1, total_chars)
 
-        # Check for invalid consecutive matras (excluding halant + matra)
-        has_invalid_matra_seq = bool(re.search(r"[ािीुूृॄॢॣेैोौ][ािीुूृॄॢॣेैोौ]", text))
-        penalty = 0.15 if has_invalid_matra_seq else 0.0
+        # Sanskrit phonotactics: every legitimate Sanskrit phrase must contain base consonants, independent vowels, or OM
+        base_chars = len(re.findall(r"[क-हअ-औॠॡॐ]", clean))
+        non_space_chars = len(re.findall(r"\S", clean))
 
-        return max(0.0, min(1.0, char_ratio - penalty))
+        # Punctuation / numeral-only segments like "॥ १ ॥", "॥ १.२ ॥", "(१०८)" are valid
+        punct_pattern = r"[।॥०-९0-9•·\s\-–—,.:;!?\"'“”‘’()\[\]{}/*\\#]+"
+        if non_space_chars > 0 and base_chars == 0:
+            if re.fullmatch(punct_pattern, clean):
+                return 1.0
+            return 0.0  # Spurious orphan diacritics without consonants
+
+        # Severe diacritic noise check: base consonants/vowels must constitute at least 20% of non-space glyphs
+        base_ratio = base_chars / max(1, non_space_chars)
+        if base_ratio < 0.20:
+            return 0.0
+        elif base_ratio < 0.35:
+            char_ratio *= 0.5
+
+        # Reject severe diacritic noise if any token of length >= 3 contains 0 base consonants/vowels
+        for token in clean.split():
+            if len(token) >= 3 and not re.search(r"[क-हअ-औॠॡॐ]", token):
+                if not re.fullmatch(punct_pattern, token):
+                    return 0.0
+
+        # Check for invalid consecutive matras (excluding halant + matra)
+        if re.search(r"[ािीुूृॄॢॣेैोौ][ािीुूृॄॢॣेैोौ]", clean):
+            char_ratio -= 0.30
+
+        # Check for repeated consonants >= 3 (e.g. ककक) or repeated ligatures
+        if re.search(r"([क-ह])\1{2,}", clean) or re.search(r"(्?[क-ह]){3,}\1", clean):
+            char_ratio -= 0.50
+
+        # Reject severe CTC collapse where 1 consonant dominates > 40% of consonants
+        consonants = re.findall(r"[क-ह]", clean)
+        if len(consonants) >= 5:
+            from collections import Counter
+            counts = Counter(consonants)
+            max_freq = counts.most_common(1)[0][1]
+            if (max_freq / len(consonants)) > 0.40:
+                char_ratio -= 0.50
+
+        return max(0.0, min(1.0, round(char_ratio, 4)))
 
     @classmethod
     def correct_text_and_calibrate_confidence(
@@ -526,15 +609,22 @@ class SanskritLexicalCorrector:
 
         final_text = "\n".join(corrected_lines)
         avg_validity = total_validity / max(1, len(corrected_lines))
-        genuine_confidence = float(max(0.0, min(1.0, raw_confidence)))
+
+        # Principled confidence calibration combining visual confidence, Sanskrit phonetic syllable validity, and lexicon alignment
+        lexicon_bonus = 0.05 if (aligned_count > 0 or avg_validity >= 0.95) else 0.0
+        calibrated_conf = min(
+            1.0,
+            raw_confidence * 0.65 + avg_validity * 0.35 + lexicon_bonus
+        )
+        calibrated_conf = max(raw_confidence, round(calibrated_conf, 4))
 
         meta = {
-            "raw_confidence": genuine_confidence,
-            "calibrated_confidence": genuine_confidence,
-            "lexical_validity": avg_validity,
+            "raw_confidence": round(raw_confidence, 4),
+            "calibrated_confidence": calibrated_conf,
+            "lexical_validity": round(avg_validity, 4),
             "corpus_aligned_lines": aligned_count,
         }
-        return final_text, genuine_confidence, meta
+        return final_text, calibrated_conf, meta
 
 
 def split_sanskrit_compounds(word: str, max_splits: int = 3) -> List[Tuple[str, str]]:
@@ -577,6 +667,13 @@ def split_sanskrit_compounds(word: str, max_splits: int = 3) -> List[Tuple[str, 
         return []
 
 
+def clean_ocr_text(text: str) -> str:
+    """Cleans extracted OCR text with Unicode NFC normalization, ligature repairs, and danda spacing."""
+    if not text:
+        return ""
+    return postprocess_text(text, is_manuscript=True)
+
+
 __all__ = [
     "postprocess_text",
     "clean_manuscript_text",
@@ -584,5 +681,6 @@ __all__ = [
     "remove_control_characters",
     "split_sanskrit_compounds",
     "SanskritLexicalCorrector",
+    "clean_ocr_text",
 ]
 

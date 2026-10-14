@@ -393,12 +393,17 @@ class PaddleSanskritOCR:
         target_w = max(32, int(w * scale))
         resized = cv2.resize(gray, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
 
-        clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
-        enhanced = clahe.apply(resized)
+        # Bilateral filter to smooth paper grain noise while preserving sharp character edges
+        smoothed = cv2.bilateralFilter(resized, d=5, sigmaColor=35, sigmaSpace=35)
 
-        # Subtle morphological stroke healing to connect faint breaks in shirorekha & ligatures
+        # Enhance faint strokes using background subtraction and CLAHE
+        from src.preprocessing import enhance_faint_strokes, heal_shirorekha_and_ligatures
+        faint_boosted = enhance_faint_strokes(smoothed, clip_limit=2.8, boost_factor=1.6)
+
+        # Directional Shirorekha & ligature healing (connect faint pen breaks)
+        healed = heal_shirorekha_and_ligatures(faint_boosted, kernel_size=(3, 1))
         close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        healed = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, close_k)
+        healed = cv2.morphologyEx(healed, cv2.MORPH_CLOSE, close_k)
 
         blurred = cv2.GaussianBlur(healed, (0, 0), 1.0)
         sharpened = cv2.addWeighted(healed, 1.3, blurred, -0.3, 0)
@@ -410,20 +415,62 @@ class PaddleSanskritOCR:
         if not self.is_available or crop.size == 0:
             return "", 0.0
         try:
+            pad_x = 16
+            pad_y = 8
+            padded = cv2.copyMakeBorder(crop, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=[255, 255, 255])
             if hasattr(self.engine, "paddlex_pipeline") and hasattr(self.engine.paddlex_pipeline, "text_rec_model"):
-                h, w = crop.shape[:2]
-                pad_x = 16
-                pad_y = 8
-                padded = cv2.copyMakeBorder(crop, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=[255, 255, 255])
                 rec_out = list(self.engine.paddlex_pipeline.text_rec_model([padded]))
                 if rec_out:
                     item = rec_out[0]
                     text = str(item.get("rec_text", "")).strip()
                     score = float(item.get("rec_score", 0.0))
                     return text, score
+            if hasattr(self.engine, "ocr"):
+                rec_out = self.engine.ocr(padded, det=False, cls=False)
+                if rec_out and len(rec_out) > 0:
+                    first = rec_out[0]
+                    if isinstance(first, (list, tuple)) and len(first) >= 2:
+                        return str(first[0]).strip(), float(first[1])
+                    elif isinstance(first, tuple) and len(first) == 2 and isinstance(first[0], str):
+                        return str(first[0]).strip(), float(first[1])
         except Exception:
             pass
         return "", 0.0
+
+    @staticmethod
+    def _score_candidate(candidate_text: str, candidate_conf: float, base_text: str) -> float:
+        """Score candidate hypothesis using confidence, Sanskrit phonotactics, and length regularization."""
+        cand_clean = candidate_text.strip()
+        if not cand_clean:
+            return 0.0
+
+        if PaddleSanskritOCR.is_phantom_diacritic_segment(cand_clean):
+            return 0.0
+
+        from src.postprocess import SanskritLexicalCorrector
+        validity = SanskritLexicalCorrector.calculate_sanskrit_validity(cand_clean)
+
+        base_clean = base_text.strip()
+        base_len = len(base_clean)
+        cand_len = len(cand_clean)
+
+        # Length regularization factor: penalize candidates that collapse or drop characters
+        if base_len > 0 and cand_len < base_len:
+            length_factor = (cand_len / base_len) ** 0.8
+        elif base_len >= 4 and cand_len > int(base_len * 1.6):
+            # Penalize candidate hallucination / runaway length bloat
+            length_factor = (base_len / cand_len) ** 0.8
+        else:
+            length_factor = 1.0
+
+        # Metric cadence bonus / penalty: if base line ends with double danda ॥, preserving it is vital
+        if base_clean.endswith("॥") and not cand_clean.endswith("॥"):
+            length_factor *= 0.85
+        if base_clean.endswith("।") and not (cand_clean.endswith("।") or cand_clean.endswith("॥")):
+            length_factor *= 0.90
+
+        score = float(candidate_conf * (1.0 + 0.35 * validity) * length_factor)
+        return score
 
     def _apply_tta_to_segments(
         self,
@@ -431,7 +478,7 @@ class PaddleSanskritOCR:
         segments: List[Dict[str, Any]],
         conf_threshold: float = 0.88,
     ) -> List[Dict[str, Any]]:
-        """Apply Test-Time Augmentation (TTA) to improve recognition on lines."""
+        """Apply Multi-View Test-Time Augmentation (TTA) with consensus scoring on lines."""
         if type(self.engine).__name__ == "FakePaddleEngine":
             return segments
 
@@ -440,14 +487,12 @@ class PaddleSanskritOCR:
 
         for seg in segments:
             x, y, w, h = seg["box"]
-            conf = seg.get("conf", 0.0)
+            base_text = seg["text"].strip()
+            base_conf = float(seg.get("conf", 0.0))
 
-            if w < 10 or h < 8:
+            if w < 10 or h < 8 or not base_text:
                 enhanced_segments.append(seg)
                 continue
-
-            best_text = seg["text"]
-            best_conf = conf
 
             # Safe crop with vertical & horizontal padding for matras
             pad_v = max(6, int(h * 0.18))
@@ -455,43 +500,54 @@ class PaddleSanskritOCR:
             x1, y1 = max(0, x - pad_h_crop), max(0, y - pad_v)
             x2, y2 = min(img_w, x + w + pad_h_crop), min(img_h, y + h + pad_v)
             crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                enhanced_segments.append(seg)
+                continue
 
-            # 1. Custom fine-tuned SanskritCRNN with hallucination safeguard
-            if paddle is not None and self.custom_crnn is not None and crop.size > 0:
-                crnn_text, crnn_conf = self._predict_crnn(crop)
-                if self._is_valid_crnn_candidate(crnn_text, best_text, crnn_conf, best_conf):
-                    best_text = crnn_text
-                    best_conf = crnn_conf
+            # 3 Views for Multi-View Consensus:
+            # View 1: Native normalized crop (scaled to standard 48px receptive field)
+            try:
+                from src.preprocessing import normalize_line_crop
+                view1 = normalize_line_crop(crop, target_h=48)
+            except Exception:
+                view1 = crop
 
-                # Ruled notebook line suppression for handwritten notes
-                try:
-                    from src.preprocessing import suppress_notebook_ruled_lines
-                    clean_crop = suppress_notebook_ruled_lines(crop)
-                    crnn_clean_text, crnn_clean_conf = self._predict_crnn(clean_crop)
-                    if self._is_valid_crnn_candidate(crnn_clean_text, best_text, crnn_clean_conf, best_conf):
-                        best_text = crnn_clean_text
-                        best_conf = crnn_clean_conf
-                except Exception:
-                    pass
+            # View 2: Faint-ink enhanced & contrast-stretched crop
+            view2 = self._enhance_crop(crop)
+            # View 3: Ruled-line suppressed & stroke-healed crop
+            try:
+                from src.preprocessing import suppress_notebook_ruled_lines, heal_shirorekha_and_ligatures
+                clean_crop = suppress_notebook_ruled_lines(crop)
+                clean_gray = cv2.cvtColor(clean_crop, cv2.COLOR_BGR2GRAY) if clean_crop.ndim == 3 else clean_crop
+                view3_healed = heal_shirorekha_and_ligatures(clean_gray, kernel_size=(3, 1))
+                view3 = cv2.cvtColor(view3_healed, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                view3 = view2
 
-                enhanced_crop = self._enhance_crop(crop)
-                crnn_enh_text, crnn_enh_conf = self._predict_crnn(enhanced_crop)
-                if self._is_valid_crnn_candidate(crnn_enh_text, best_text, crnn_enh_conf, best_conf):
-                    best_text = crnn_enh_text
-                    best_conf = crnn_enh_conf
+            candidates: List[Tuple[str, float, float]] = []
+            # Baseline segment is always a candidate
+            base_score = self._score_candidate(base_text, base_conf, base_text)
+            candidates.append((base_text, base_conf, base_score))
 
-            # 2. Base model direct rec fallback if confidence remains below threshold
-            if best_conf < conf_threshold and crop.size > 0:
-                d_text, d_conf = self._predict_direct_rec(crop)
-                if d_conf > best_conf and len(d_text) >= 1:
-                    best_text = d_text
-                    best_conf = d_conf
+            # Run SanskritCRNN on views if available
+            if paddle is not None and self.custom_crnn is not None:
+                for v in (view1, view2, view3):
+                    t, c = self._predict_crnn(v)
+                    if t and self._is_valid_crnn_candidate(t, base_text, c, base_conf):
+                        s = self._score_candidate(t, c, base_text)
+                        candidates.append((t, c, s))
 
-                enhanced_crop = self._enhance_crop(crop)
-                e_text, e_conf = self._predict_direct_rec(enhanced_crop)
-                if e_conf > best_conf and len(e_text) >= 1:
-                    best_text = e_text
-                    best_conf = e_conf
+            # Run Direct Rec on views if baseline confidence is sub-optimal or to cross-validate
+            if base_conf < conf_threshold or len(candidates) <= 1:
+                for v in (view1, view2, view3):
+                    t, c = self._predict_direct_rec(v)
+                    if t and len(t) >= 1:
+                        s = self._score_candidate(t, c, base_text)
+                        candidates.append((t, c, s))
+
+            # Pick highest-scoring consensus candidate
+            best_cand = max(candidates, key=lambda item: item[2])
+            best_text, best_conf = best_cand[0], best_cand[1]
 
             enhanced_segments.append({
                 "text": best_text,
@@ -532,16 +588,31 @@ class PaddleSanskritOCR:
         if re.search(r"[ुृॢ॒॑]{2,}", crnn_text) or re.search(r"ु॒ु", crnn_text):
             return False
 
+        # Reject repetitive CTC loops / collapses
+        # In real Sanskrit, no single consonant dominates > 38% of a sequence of 5+ consonants
+        from collections import Counter
+        consonants = re.findall(r"[क-ह]", crnn_text)
+        if len(consonants) >= 5:
+            counts = Counter(consonants)
+            max_freq = counts.most_common(1)[0][1]
+            if (max_freq / len(consonants)) > 0.38:
+                return False
+
+        # No 3+ identical consonants or repeated ligatures like ककक or क्कक्क
+        if re.search(r"([क-ह])\1{2,}", crnn_text) or re.search(r"(्?[क-ह]){3,}\1", crnn_text):
+            return False
+
         # If base model already recognized a full sentence line, CRNN must not collapse into a tiny fragment
         base_consonants = len(re.findall(r"[क-हअ-औ0-9a-zA-Z]", base_text))
         if base_consonants >= 10 and base_chars < int(base_consonants * 0.55):
             return False
 
-        # CRNN must strictly improve confidence
-        if crnn_conf <= base_conf:
+        # CRNN candidate must meet minimum confidence threshold
+        if crnn_conf < 0.50:
             return False
 
         return True
+
 
     @staticmethod
     def is_phantom_diacritic_segment(text: str) -> bool:
@@ -550,10 +621,12 @@ class PaddleSanskritOCR:
         repeating non-spacing diacritics, Vedic stress marks, or isolated matras without base consonants.
         """
         import re
+        if not text or not isinstance(text, str):
+            return False
         clean = text.strip()
         if not clean or clean in {"।", "॥", "|", "||", ".", "-", "_"}:
             return False
-        base_chars = len(re.findall(r"[क-हअ-औ0-9a-zA-Z]", clean))
+        base_chars = len(re.findall(r"[क-हअ-औॠॡॐ0-9a-zA-Z]", clean))
         diacritics = len(re.findall(r"[ा-ौ्ंःँ॒॑]", clean))
         total = base_chars + diacritics
         if total == 0:
@@ -649,6 +722,12 @@ class PaddleSanskritOCR:
                 from src.preprocessing import suppress_document_borders
                 target_image = suppress_document_borders(target_image)
 
+            try:
+                from src.preprocessing import auto_deskew_image
+                target_image = auto_deskew_image(target_image)
+            except Exception:
+                pass
+
             # --- PASS 1: Native High-Fidelity Image ---
             pass1_segs, pass1_filtered = self._extract_segments_from_image(
                 target_image, multi_column=multi_column, high_accuracy_mode=high_accuracy_mode
@@ -664,9 +743,9 @@ class PaddleSanskritOCR:
             ran_pass2 = False
             pass2_conf = 0.0
 
-            # Trigger Pass 2 if Pass 1 has low confidence or found no text
+            # Trigger Pass 2 if Pass 1 has low confidence or found no text or exhibits faint strokes
             needs_pass2 = high_accuracy_mode and (
-                len(pass1_segs) == 0 or pass1_conf < 0.85 or pass1_min_conf < 0.65
+                len(pass1_segs) == 0 or pass1_conf < 0.88 or pass1_min_conf < 0.70
             )
 
             if needs_pass2:
@@ -723,8 +802,6 @@ class PaddleSanskritOCR:
                 sum(item["conf"] for item in selected_segments) / len(selected_segments)
                 if selected_segments else 0.0
             )
-            min_confidence = min((s["conf"] for s in selected_segments), default=0.0)
-            max_confidence = max((s["conf"] for s in selected_segments), default=0.0)
 
             # Apply Sanskrit Lexical Post-Correction (orthography & ligature repairs without text overwriting)
             from src.postprocess import SanskritLexicalCorrector
@@ -733,6 +810,30 @@ class PaddleSanskritOCR:
                 raw_confidence,
                 enable_corpus_alignment=enable_corpus_alignment
             )
+
+            # Calibrate individual segment confidences based on phonotactic validity and lexicon alignment
+            calibrated_segments = []
+            for seg in selected_segments:
+                seg_text = SanskritLexicalCorrector.apply_orthographic_rules(seg["text"])
+                seg_val = SanskritLexicalCorrector.calculate_sanskrit_validity(seg_text)
+                seg_raw_c = float(seg["conf"])
+                seg_bonus = 0.05 if seg_val >= 0.95 else 0.0
+                seg_calib = min(1.0, max(seg_raw_c, seg_raw_c * 0.65 + seg_val * 0.35 + seg_bonus))
+                calibrated_segments.append({
+                    "text": seg_text,
+                    "conf": round(seg_calib, 4),
+                    "box": seg["box"],
+                })
+
+            if len(calibrated_segments) == 1 and calibrated_text:
+                calibrated_segments[0]["text"] = calibrated_text
+
+            min_confidence = min((s["conf"] for s in calibrated_segments), default=0.0)
+            max_confidence = max((s["conf"] for s in calibrated_segments), default=0.0)
+            if calibrated_segments:
+                genuine_conf = round(sum(s["conf"] for s in calibrated_segments) / len(calibrated_segments), 4)
+            else:
+                genuine_conf = 0.0
 
             diag = {
                 "pass_selected": selected_pass,
@@ -748,9 +849,9 @@ class PaddleSanskritOCR:
                 "min_confidence": min_confidence,
                 "max_confidence": max_confidence,
                 "raw_confidence": raw_confidence,
-                "segment_count": len(selected_segments),
+                "segment_count": len(calibrated_segments),
                 "raw_text": raw_text,
-                "segments": selected_segments,
+                "segments": calibrated_segments,
                 "diagnostics": diag,
                 "error": None,
             }
@@ -766,4 +867,29 @@ class PaddleSanskritOCR:
                 "diagnostics": {},
                 "error": str(exc),
             }
+
+
+_OCR_INSTANCE = None
+
+
+def get_ocr_engine(device: str = "cpu") -> PaddleSanskritOCR:
+    global _OCR_INSTANCE
+    if _OCR_INSTANCE is None:
+        _OCR_INSTANCE = PaddleSanskritOCR(device=device)
+    return _OCR_INSTANCE
+
+
+def perform_ocr(image, high_accuracy_mode: bool = True, enable_corpus_alignment: bool = True) -> str:
+    """Extract Devanagari text using high-performance PaddleSanskritOCR."""
+    if image is None:
+        return ""
+    img_np = np.array(image)
+    engine = get_ocr_engine()
+    result = engine.recognize(
+        img_np,
+        high_accuracy_mode=high_accuracy_mode,
+        enable_corpus_alignment=enable_corpus_alignment
+    )
+    return result.get("text", "")
+
 
