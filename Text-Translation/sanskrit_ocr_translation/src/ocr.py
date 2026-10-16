@@ -651,19 +651,35 @@ class PaddleSanskritOCR:
         for page in self._run_engine(prepared):
             raw_segments.extend(self._segments_from_result(page, img_h=img_h))
 
-        # Direct crop inference fallback if detector found no bounding box (e.g. single character glyph)
+        # Direct crop inference fallback if detector found no bounding box (e.g. single character glyph or faint word)
         if not raw_segments and prepared.size > 0:
-            crnn_t, crnn_c = "", 0.0
+            rec_cands = []
+            direct_t, direct_c = self._predict_direct_rec(prepared)
+            if direct_t:
+                rec_cands.append((direct_t, direct_c, self._score_candidate(direct_t, direct_c, direct_t)))
             if self.custom_crnn is not None:
                 crnn_t, crnn_c = self._predict_crnn(prepared)
-            if not crnn_t:
-                crnn_t, crnn_c = self._predict_direct_rec(prepared)
-            if crnn_t:
+                if crnn_t and self._is_valid_crnn_candidate(crnn_t, direct_t or "", crnn_c, direct_c):
+                    rec_cands.append((crnn_t, crnn_c, self._score_candidate(crnn_t, crnn_c, direct_t or "")))
+            if rec_cands:
+                best_t, best_c, _ = max(rec_cands, key=lambda it: it[2])
                 raw_segments.append({
-                    "text": crnn_t,
-                    "conf": float(crnn_c),
+                    "text": best_t,
+                    "conf": float(best_c),
                     "box": (0, 0, int(prepared.shape[1]), int(prepared.shape[0])),
                 })
+
+        # Single-line or isolated crop validation: check if direct rec captured edge glyphs clipped by DBNet
+        if len(raw_segments) == 1 and (img_h <= 128 or (prepared.shape[1] / max(1, img_h)) >= 2.0):
+            direct_t, direct_c = self._predict_direct_rec(prepared)
+            if direct_t:
+                seg_text = raw_segments[0]["text"]
+                if len(direct_t) > len(seg_text) and (direct_t.endswith(("ः", "।", "॥")) or direct_c >= raw_segments[0]["conf"]):
+                    score_direct = self._score_candidate(direct_t, direct_c, seg_text)
+                    score_seg = self._score_candidate(seg_text, raw_segments[0]["conf"], seg_text)
+                    if score_direct > score_seg:
+                        raw_segments[0]["text"] = direct_t
+                        raw_segments[0]["conf"] = max(raw_segments[0]["conf"], direct_c)
 
         # Topological reading order sorting
         sorted_segs = self.sort_segments_topological(raw_segments, multi_column=multi_column)
@@ -725,6 +741,12 @@ class PaddleSanskritOCR:
             try:
                 from src.preprocessing import auto_deskew_image
                 target_image = auto_deskew_image(target_image)
+            except Exception:
+                pass
+
+            try:
+                from src.preprocessing import preflight_image_enhancement
+                target_image = preflight_image_enhancement(target_image)
             except Exception:
                 pass
 

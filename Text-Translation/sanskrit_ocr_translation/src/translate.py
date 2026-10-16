@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict
+
+# Set default socket timeout to prevent external MT network requests from hanging
+socket.setdefaulttimeout(5.0)
 
 try:
     from deep_translator import GoogleTranslator, MyMemoryTranslator

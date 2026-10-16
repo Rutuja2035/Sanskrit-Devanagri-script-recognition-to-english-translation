@@ -704,6 +704,81 @@ def auto_deskew_image(image: np.ndarray, max_angle: float = 15.0) -> np.ndarray:
     return deskew_text_lines(image, max_angle=max_angle)
 
 
+def preflight_image_enhancement(
+    image: np.ndarray,
+    min_line_height: int = 56,
+    pad_tight_crops: bool = True,
+    level_illumination: bool = True,
+) -> np.ndarray:
+    """
+    Intelligent pre-flight image normalization for open-domain Sanskrit Devanagari OCR.
+    
+    Ensures that any arbitrary input image (isolated word crops, low-resolution phone photos,
+    faint ink, uneven shadows) conforms to the optimal optical receptive fields:
+    
+    1. Polarity check: inverts dark backgrounds to ensure dark ink on light background.
+    2. Small Crop Super-Resolution: if line/word height < min_line_height (56px), scales up
+       using cubic interpolation and applies unsharp sharpening to restore Devanagari stroke edge clarity.
+    3. Intelligent Margin Padding: tight crops with zero margin cause DBNet and CRNN to clip
+       outer matras (e.g. upper ikara/anusvara, lower halants, or outer visarga 'ः').
+       Adds a 20-24px clean white border if the image is a single line, tight crop, or high aspect ratio.
+    4. Flat-Field Illumination Leveling: detects non-uniform smartphone flash or shadows across
+       quadrants and levels background gradients while preserving ink contrast.
+    """
+    if not isinstance(image, np.ndarray) or image.size == 0:
+        return image
+
+    processed = image.copy()
+    if processed.ndim == 2:
+        processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    elif processed.ndim == 3 and processed.shape[2] == 4:
+        processed = cv2.cvtColor(processed, cv2.COLOR_RGBA2BGR)
+
+    h, w = processed.shape[:2]
+    if h == 0 or w == 0:
+        return processed
+
+    # 1. Polarity normalization
+    gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+    if float(np.mean(gray)) < 110:
+        processed = cv2.bitwise_not(processed)
+        gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+
+    # 2. Illumination leveling if significant lighting variation exists across quadrants
+    if level_illumination and h >= 64 and w >= 64:
+        h_mid, w_mid = h // 2, w // 2
+        q1 = float(np.mean(gray[:h_mid, :w_mid]))
+        q2 = float(np.mean(gray[:h_mid, w_mid:]))
+        q3 = float(np.mean(gray[h_mid:, :w_mid]))
+        q4 = float(np.mean(gray[h_mid:, w_mid:]))
+        quad_std = float(np.std([q1, q2, q3, q4]))
+        if quad_std > 18.0:
+            processed = flat_field_correction(processed, kernel_ratio=0.35)
+            gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+
+    # 3. Super-resolution / Upscaling for small crops or low-resolution lines
+    if h < min_line_height:
+        scale = float(min_line_height) / float(h)
+        new_w = max(16, int(round(w * scale)))
+        processed = cv2.resize(processed, (new_w, min_line_height), interpolation=cv2.INTER_CUBIC)
+        # Unsharp sharpening to restore stroke crispness
+        blur = cv2.GaussianBlur(processed, (0, 0), 1.0)
+        processed = np.clip(cv2.addWeighted(processed, 1.25, blur, -0.25, 0), 0, 255).astype(np.uint8)
+        h, w = processed.shape[:2]
+
+    # 4. Smart margin padding for isolated crops and single lines
+    # DBNet requires margin around characters; tight borders cause missing outer characters/matras.
+    is_crop = (h <= 128) or (float(w) / max(1.0, float(h)) >= 2.0) or (float(h) / max(1.0, float(w)) >= 2.0)
+    if pad_tight_crops and is_crop:
+        pad_y = max(16, min(32, int(h * 0.25)))
+        pad_x = max(24, min(40, int(h * 0.35)))
+        processed = cv2.copyMakeBorder(
+            processed, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=[255, 255, 255]
+        )
+
+    return processed
+
+
 def clean_image(image, is_manuscript: bool = True):
     """Clean and enhance Sanskrit image with Sauvola binarization, deskewing, and contrast curves."""
     if image is None:
@@ -732,6 +807,7 @@ __all__ = [
     "deskew_text_lines",
     "auto_deskew_image",
     "normalize_line_crop",
+    "preflight_image_enhancement",
     "suppress_notebook_ruled_lines",
     "preprocess_handwritten",
     "preprocess_manuscript",

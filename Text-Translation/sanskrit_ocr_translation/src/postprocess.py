@@ -452,12 +452,14 @@ class SanskritLexicalCorrector:
             if max_l > 0 and (2.0 * min_l / (len_target + len_cand)) < min_similarity:
                 continue
 
+            # Prevent short words or fragments from hijacking entire sentences (or vice-versa)
+            len_ratio = min_l / float(max_l) if max_l > 0 else 0.0
+            if len_ratio < 0.80:
+                continue
+
             ratio = difflib.SequenceMatcher(None, clean_target, clean_cand).ratio()
 
-            # Substring match requires length ratio >= 0.75 to prevent short fragments/words
-            # from hijacking full lines (or vice-versa)
-            len_ratio = min_l / float(max_l)
-            if len_target >= 8 and len_ratio >= 0.75 and (clean_target in clean_cand or clean_cand in clean_target):
+            if len_target >= 8 and len_ratio >= 0.85 and (clean_target in clean_cand or clean_cand in clean_target):
                 ratio = max(ratio, 0.94)
 
             if ratio > best_score:
@@ -487,6 +489,93 @@ class SanskritLexicalCorrector:
         if clean_target in cls._EXACT_CORPUS_MAP:
             return cls._EXACT_CORPUS_MAP[clean_target], 1.0
         return line, best_score
+
+    @classmethod
+    def get_vocabulary_set(cls) -> set:
+        """Lazy load the 330k+ Sanskrit classical vocabulary set for sub-millisecond word validation."""
+        if getattr(cls, "_SANSKRIT_VOCAB_SET", None) is None:
+            vocab = set()
+            vocab_file = Path(__file__).resolve().parent.parent / "data" / "sanskrit_vocab_set.txt"
+            if vocab_file.exists():
+                try:
+                    with open(vocab_file, "r", encoding="utf-8") as f:
+                        vocab = set(line.strip() for line in f if line.strip())
+                except Exception:
+                    pass
+            if not vocab:
+                for text in cls.REFERENCE_CORPUS:
+                    vocab.update(re.findall(r"[\u0900-\u097F]+", text))
+            cls._SANSKRIT_VOCAB_SET = vocab
+        return cls._SANSKRIT_VOCAB_SET
+
+    CONFUSION_PAIRS = [
+        ("ष", "प"), ("प", "ष"),
+        ("व", "ब"), ("ब", "व"),
+        ("श", "स"), ("स", "श"),
+        ("ध", "घ"), ("घ", "ध"),
+        ("भ", "म"), ("म", "भ"),
+        ("रव", "ख"),
+        ("ि", "ी"), ("ी", "ि"),
+        ("ु", "ू"), ("ू", "ु"),
+    ]
+
+    @classmethod
+    def snap_word_to_lexicon(cls, word: str) -> str:
+        """
+        Snap an extracted OCR word to authentic classical Sanskrit vocabulary.
+        Uses fast O(1) set membership and generates edit-distance-1 Devanagari OCR confusion hypotheses.
+        """
+        if not word or not isinstance(word, str):
+            return word
+
+        vocab = cls.get_vocabulary_set()
+        if not vocab or word in vocab:
+            return word
+
+        # Separate leading and trailing dandas / punctuation
+        m_p = re.match(r"^([।॥०-९0-9\(\[\{\<\'\"–—\.\,\:\;\-\s]+)", word)
+        p_str = m_p.group(1) if m_p else ""
+        m_s = re.search(r"([।॥०-९0-9\)\]\}\>\'\"–—\.\,\:\;\-\s]+)$", word)
+        s_str = m_s.group(1) if m_s else ""
+        core = word[len(p_str):len(word)-len(s_str)] if s_str else word[len(p_str):]
+
+        if not core or core in vocab:
+            return word
+
+        # Fast check 1: missing visarga or case markers at end
+        for suffix in ("ः", "ाः", "म्", "ं", "े", "ौ"):
+            if (core + suffix) in vocab:
+                return p_str + core + suffix + s_str
+
+        # Fast check 2: extra trailing visarga or anusvara
+        if len(core) >= 3 and core.endswith(("ः", "ं", "्")):
+            stripped = core[:-1]
+            if stripped in vocab:
+                return p_str + stripped + s_str
+
+        # Fast check 3: single character OCR confusion pairs
+        for src, tgt in cls.CONFUSION_PAIRS:
+            if src in core:
+                idx = 0
+                while True:
+                    pos = core.find(src, idx)
+                    if pos == -1:
+                        break
+                    cand = core[:pos] + tgt + core[pos+len(src):]
+                    if cand in vocab:
+                        return p_str + cand + s_str
+                    if (cand + "ः") in vocab:
+                        return p_str + cand + "ः" + s_str
+                    idx = pos + 1
+        # Fast check 4: displaced pre-base ikara matra (e.g. वगित -> विगत)
+        if "ि" in core:
+            cand_ikara = re.sub(r"([क-ह])([क-ह])ि", r"\1ि\2", core)
+            if cand_ikara in vocab:
+                return p_str + cand_ikara + s_str
+            if (cand_ikara + "ः") in vocab:
+                return p_str + cand_ikara + "ः" + s_str
+
+        return word
 
     @classmethod
     def calculate_sanskrit_validity(cls, text: str) -> float:
@@ -597,11 +686,19 @@ class SanskritLexicalCorrector:
 
             # Apply orthographic & ligature repairs without altering words
             corrected = cls.apply_orthographic_rules(line_str)
+            aligned_line = False
             if enable_corpus_alignment:
                 aligned, score = cls.align_with_corpus(corrected, min_similarity=0.70)
                 if score >= 0.70:
                     corrected = aligned
                     aligned_count += 1
+                    aligned_line = True
+
+            # If not aligned to an entire sentence/verse, snap individual words to authentic lexicon
+            if not aligned_line:
+                tokens = corrected.split()
+                snapped_tokens = [cls.snap_word_to_lexicon(w) for w in tokens]
+                corrected = " ".join(snapped_tokens)
 
             val = cls.calculate_sanskrit_validity(corrected)
             total_validity += val
